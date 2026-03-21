@@ -2,147 +2,797 @@
 
 > 版本：1.0  
 > 日期：2026-03-21  
-> 作者：研发团队
+> 作者：研发团队  
+> 状态：开发指导文档
 
 ---
 
-## 一、技术选型
+## 文档目录
 
-| 层次 | 技术选型 | 说明 |
-|------|----------|------|
-| 核心框架 | Spring Boot 3.x | 基础容器，自动装配 |
-| 网络通信 | Netty 4.x | 高性能异步 RPC，无阻塞 I/O |
-| 时间轮调度 | HashedWheelTimer（Netty 内置） | 亚毫秒级调度精度 |
-| 高性能队列 | Disruptor（LMAX） | 无锁队列，百万级 TPS |
-| 数据存储 | MySQL 8.x + ShardingSphere | 任务元数据 + 分库分表支持 |
-| 缓存 / 选举 | Redis 7.x（Redisson） | 分布式锁、限流计数、主从选举 |
-| 注册中心 | 内置轻量注册中心 + Nacos 适配 | 开发友好，生产可替换 |
-| ORM | MyBatis-Plus | CRUD + 动态 SQL |
-| 序列化 | Kryo（RPC）+ Jackson（JSON） | 高速序列化，大小减少 5-10x |
-| 构建工具 | Maven（多模块） | Gradle 可选 |
-| CLI | Picocli | 代码生成命令行 |
-| 测试 | JUnit 5 + Testcontainers + JMH | 微基准压测 |
-| 链路追踪 | OpenTelemetry + Jaeger | 标准可观测方案 |
+1. [技术选型与架构理念](#一技术选型与架构理念)
+2. [整体架构设计](#二整体架构设计)
+3. [模块工程结构](#三模块工程结构)
+4. [核心模块详细设计](#四核心模块详细设计)
+5. [任务调度核心](#五任务调度核心)
+6. [微服务治理模块](#六微服务治理模块)
+7. [执行器-sdk](#七执行器-sdk)
+8. [集群高可用设计](#八集群高可用设计)
+9. [数据库设计](#九数据库设计)
+10. [配置与接入](#十配置与接入)
+11. [性能优化策略](#十一性能优化策略)
+12. [开发计划与里程碑](#十二开发计划与里程碑)
 
 ---
 
-## 二、集群架构
+## 一、技术选型与架构理念
 
-### 2.1 整体拓扑
+### 1.1 技术选型总览
+
+| 层次 | 技术选型 | 版本 | 说明 |
+|------|----------|------|------|
+| 基础框架 | Spring Boot | 3.x | 基础容器，自动装配，生态丰富 |
+| 网络通信 | Netty | 4.1.x | 高性能异步 RPC，无阻塞 I/O |
+| 时间轮调度 | HashedWheelTimer | Netty 内置 | 亚毫秒级调度精度，无锁设计 |
+| 高性能队列 | Disruptor | 3.5.x | 无锁队列，百万级 TPS，LMAX 开源 |
+| 数据存储 | MySQL | 8.x | 任务元数据、调度日志 |
+| 缓存/选举 | Redis | 7.x | 分布式锁、限流计数、注册发现 |
+| 注册中心 | 内置 + Nacos 适配 | - | 开发友好，生产可替换 Nacos |
+| ORM | MyBatis-Plus | 3.5.x | CRUD + 动态 SQL，少配置 |
+| 序列化 | Kryo + Jackson | 5.5.x | Kryo 用于 RPC 高速序列化，比 JSON 快 5-10 倍 |
+| 构建工具 | Maven | 3.8+ | 多模块项目结构 |
+| CLI | Picocli | 4.x | 代码生成命令行工具 |
+| 链路追踪 | OpenTelemetry | 1.x | 标准可观测方案，对接 Jaeger/Zipkin |
+| 测试 | JUnit 5 + JMH | 5.x | 单元测试 + 微基准压测 |
+
+### 1.2 架构设计理念
 
 ```
-                              ┌──────────────────┐
-                              │   Admin Console   │
-                              │  (Vue3 控制台)     │
-                              └────────┬─────────┘
-                                       │ REST
-                    ┌──────────────────▼──────────────────┐
-                    │           JZero Cluster (3-Nodes)      │
-                    │                                          │
-                    │  ┌─────────────┐   ┌─────────────┐       │
-                    │  │ Master Node │◄─►│ Slave Node  │       │
-                    │  │  Raft Leader │   │  Follower   │       │
-                    │  │  调度触发     │   │  状态同步    │       │
-                    │  └──────┬──────┘   └──────┬──────┘       │
-                    │         │ Raft/WAL        │              │
-                    │  ┌──────▼──────┐   ┌─────────────┐        │
-                    │  │ Slave Node  │   │ Slave Node  │        │
-                    │  └─────────────┘   └─────────────┘        │
-                    └──────────────────────────────────────────┘
-                             │ Netty RPC              │ HTTP/gRPC
-           ┌─────────────────▼────────┐  ┌─────────────────────▼──────┐
-           │    Executor Cluster       │  │    Microservice Cluster   │
-           │  [Node-A] [Node-B] [C]   │  │  Gateway | Svc-A | Svc-B  │
-           └───────────────────────────┘  └───────────────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│                      JZero 架构理念                               │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  1. 性能优先                                                   │
+│     ├── 时间轮调度 → 亚毫秒级精度，<5ms 延迟                    │
+│     ├── Disruptor 无锁队列 → 百万级 TPS                        │
+│     ├── Netty NIO → 万级并发连接                               │
+│     └── Kryo 序列化 → 减少网络开销 5-10 倍                     │
+│                                                                 │
+│  2. 轻量设计                                                   │
+│     ├── 核心依赖 < 10 个                                        │
+│     ├── 启动时间 < 10 秒                                       │
+│     └── 内存占用 < 200MB（空载）                                │
+│                                                                 │
+│  3. 模块化架构                                                 │
+│     ├── 调度、执行、网关可独立使用                               │
+│     ├── SPI 机制扩展                                           │
+│     └── 按需开启功能                                           │
+│                                                                 │
+│  4. 生产级特性                                                 │
+│     ├── 集群高可用（<3s 故障切换）                              │
+│     ├── 多语言执行器支持（gRPC）                                │
+│     └── 可观测性（OpenTelemetry）                              │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 1.3 性能指标承诺
+
+| 指标 | 目标值 | 对比 XXL-JOB |
+|------|--------|-------------|
+| 调度吞吐量 | > 100,000 任务/秒 | 10 倍 |
+| 调度延迟 P99 | < 5ms | 20 倍 |
+| RPC 延迟 P99 | < 3ms | - |
+| 网关吞吐 | > 30,000 QPS | - |
+| 启动时间 | < 10 秒 | 3 倍 |
+| 内存占用 | < 200MB | 减少 40% |
+
+---
+
+## 二、整体架构设计
+
+### 2.1 整体架构图
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                              JZero                                   │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  ┌───────────────────────┐     ┌───────────────────────┐            │
+│  │      JZero Admin      │     │       JZero CLI       │            │
+│  │     (Web 控制台)      │     │    (代码生成工具)     │            │
+│  │  任务|服务|日志|监控   │     │  一键生成项目骨架      │            │
+│  └───────────┬───────────┘     └───────────┬───────────┘            │
+│              │                             │                         │
+│              └─────────────┬───────────────┘                         │
+│                            │                                         │
+│              ┌─────────────▼─────────────┐                           │
+│  ┌──────────┤        JZero Core         ├──────────┐               │
+│  │          └─────────────┬─────────────┘          │               │
+│  │                        │                         │               │
+│  │  ┌─────────────────────┼─────────────────────┐ │               │
+│  │  │                     │                       │ │               │
+│  │  ▼                     ▼                       ▼ │               │
+│  │ ┌──────────┐    ┌──────────┐    ┌──────────┐   │               │
+│  │ │Scheduler │    │ Executor │    │  Gateway  │   │               │
+│  │ │(调度中心) │    │ (执行器)  │    │   (网关)  │   │               │
+│  │ │          │    │          │    │           │   │               │
+│  │ │时间轮调度 │    │ 任务执行 │    │  路由转发  │   │               │
+│  │ │路由策略   │    │  RPC客户端│    │  限流熔断  │   │               │
+│  │ │选举管理   │    │ 心跳管理 │    │  鉴权限流  │   │               │
+│  │ └────┬─────┘    └────┬─────┘    └────┬─────┘   │               │
+│  │      │               │               │          │               │
+│  │ ┌────┴───────────────┴───────────────┴────┐   │               │
+│  │ │              核心能力层                    │   │               │
+│  │ │  时间轮 │ Disruptor │ Netty RPC │ 熔断限流  │   │               │
+│  │ │  选举 │ WAL │ 服务注册 │ 负载均衡          │   │               │
+│  │ └──────────────────────────────────────────┘   │               │
+│  │                        │                         │               │
+│  └────────────────────────┼────────────────────────┘               │
+│                           │                                          │
+│  ┌────────────────────────┼───────────────────────────────────────┐ │
+│  │                   基础设施层                                     │ │
+│  │  ┌────────┐  ┌────────┐  ┌────────┐  ┌────────┐              │ │
+│  │  │ MySQL  │  │ Redis  │  │ Nacos  │  │  MQ    │              │ │
+│  │  │ 元数据 │  │ 选举/限流│  │ 注册发现│  │ 可选   │              │ │
+│  │  └────────┘  └────────┘  └────────┘  └────────┘              │ │
+│  └───────────────────────────────────────────────────────────────┘ │
+│                                                                      │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+### 2.2 核心组件通信
+
+```
+                    ┌──────────────┐
+                    │  Scheduler   │
+                    │   Master     │
+                    └──────┬───────┘
+                           │
+           ┌───────────────┼───────────────┐
+           │               │               │
+           ▼               ▼               ▼
+     ┌──────────┐   ┌──────────┐   ┌──────────┐
+     │ Executor │   │ Executor │   │ Executor │
+     │   A      │   │   B      │   │   C      │
+     │ (Java)   │   │  (Go)    │   │ (Python) │
+     └──────────┘   └──────────┘   └──────────┘
+
+通信协议：
+├── Scheduler → Executor: gRPC / Netty（任务下发）
+├── Executor → Scheduler: gRPC / Netty（心跳 + 结果上报）
+└── 内部: Netty + Kryo（高性能）/ gRPC（多语言）
+```
+
+### 2.3 节点角色定义
+
+| 角色 | 职责 | 数量建议 | 可运行模式 |
+|------|------|----------|------------|
+| **Master（Leader）** | 任务调度触发、路由决策、WAL 日志写入、集群协调 | 1 | 仅在集群模式 |
+| **Slave（Follower）** | 实时同步 WAL 状态、热备、故障时自动竞选 | ≥ 2 | 仅在集群模式 |
+| **Scheduler** | 调度中心进程，可同时运行 Master/Slave 角色 | 3-N | 集群模式 |
+| **Executor** | 执行业务任务，向调度中心注册 | 无上限 | 独立进程 |
+
+---
+
+## 三、模块工程结构
+
+### 3.1 目录结构
+
+```
+jzero/
+├── pom.xml                                    # 父 POM，统一依赖版本管理
+│
+├── jzero-common/                              # 公共层，所有模块依赖
+│   ├── pom.xml
+│   └── src/main/java/com/jzero/common/
+│       ├── annotation/                        # 注解定义
+│       │   ├── JZeroJob.java                 # 任务注解
+│       │   └── JZeroMapper.java              # Mapper 扫描注解
+│       ├── model/                            # 数据模型
+│       │   ├── dto/                          # 数据传输对象
+│       │   ├── vo/                           # 视图对象
+│       │   ├── enums/                        # 枚举类
+│       │   └── constant/                     # 常量定义
+│       ├── rpc/                               # RPC 消息体
+│       │   ├── request/                       # 请求消息
+│       │   │   ├── RunRequest.java           # 任务执行请求
+│       │   │   ├── BeatRequest.java          # 心跳请求
+│       │   │   ├── LogReportRequest.java     # 日志上报请求
+│       │   │   ├── RegistryRequest.java      # 注册请求
+│       │   │   └── DeregistryRequest.java    # 下线请求
+│       │   └── response/                      # 响应消息
+│       │       ├── RunResponse.java          # 执行结果响应
+│       │       └── BeatResponse.java         # 心跳响应
+│       ├── exception/                         # 异常定义
+│       └── util/                              # 工具类
+│           ├── KryoUtil.java                  # Kryo 序列化
+│           └── NetUtil.java                   # 网络工具
+│
+├── jzero-core/                                # 核心抽象层
+│   ├── pom.xml
+│   └── src/main/java/com/jzero/core/
+│       ├── scheduler/                         # 调度核心抽象
+│       │   ├── JobTrigger.java               # 任务触发器接口
+│       │   ├── TriggerContext.java           # 触发上下文
+│       │   ├── RouteStrategy.java            # 路由策略接口
+│       │   └── enums/
+│       │       ├── RouteStrategyEnum.java    # 路由策略枚举
+│       │       ├── ScheduleTypeEnum.java     # 调度类型枚举
+│       │       └── BlockStrategyEnum.java    # 阻塞策略枚举
+│       ├── registry/                         # 注册中心抽象
+│       │   ├── ServiceRegistry.java          # 注册中心接口
+│       │   └── ServiceInstance.java          # 服务实例
+│       ├── circuit/                           # 熔断器
+│       │   ├── CircuitBreaker.java           # 熔断器接口
+│       │   └── CircuitConfig.java            # 熔断配置
+│       └── loadbalancer/                     # 负载均衡抽象
+│           └── LoadBalancer.java
+│
+├── jzero-scheduler/                           # 调度中心模块
+│   ├── pom.xml
+│   └── src/main/java/com/jzero/scheduler/
+│       ├── JZeroSchedulerApplication.java    # 启动类
+│       ├── config/
+│       │   ├── SchedulerConfig.java          # 调度配置
+│       │   └── NettyServerConfig.java        # Netty 服务端配置
+│       ├── election/                         # 主从选举
+│       │   ├── ElectionManager.java          # 选举管理器
+│       │   ├── RedisElection.java            # Redis 实现
+│       │   └── NodeRole.java                 # 节点角色
+│       ├── wal/                              # WAL 日志
+│       │   ├── WalStore.java                 # WAL 存储接口
+│       │   └── WalEntry.java                 # WAL 条目
+│       ├── trigger/                          # 触发器
+│       │   ├── JobTrigger.java               # 触发器实现
+│       │   ├── CronTrigger.java              # CRON 触发
+│       │   ├── FixedRateTrigger.java         # 固定频率触发
+│       │   └── OneTimeTrigger.java           # 一次性触发
+│       ├── router/                           # 路由策略实现
+│       │   ├── ExecutorRouter.java           # 路由接口
+│       │   ├── RoundRobinRouter.java         # 轮询
+│       │   ├── RandomRouter.java             # 随机
+│       │   ├── ConsistentHashRouter.java     # 一致性哈希
+│       │   ├── LeastLFRouter.java            # 最不经常使用
+│       │   ├── FailoverRouter.java          # 故障转移
+│       │   ├── ShardingRouter.java          # 分片广播
+│       │   ├── BusyTransferRouter.java      # 忙碌转移
+│       │   └── WeightedRouter.java           # 权重轮询
+│       ├── rpc-server/                       # Netty RPC 服务端
+│       │   ├── RpcServer.java                # 服务端主类
+│       │   ├── RpcServerHandler.java         # 消息处理器
+│       │   ├── KryoEncoder.java              # Kryo 编码器
+│       │   └── KryoDecoder.java              # Kryo 解码器
+│       ├── registry/                         # 内置注册中心
+│       │   ├── EmbeddedRegistry.java         # 内嵌实现
+│       │   └── EmbeddedRegistryCache.java    # 本地缓存
+│       └── log/                              # 执行日志
+│           └── JobLogService.java            # 日志服务
+│
+├── jzero-executor/                           # 执行器 SDK
+│   ├── pom.xml
+│   └── src/main/java/com/jzero/executor/
+│       ├── annotation/
+│       │   └── JZeroJob.java                 # 任务注解
+│       ├── handler/
+│       │   ├── JobHandler.java               # 任务基类
+│       │   ├── JobContext.java               # 任务上下文
+│       │   └── ReturnT.java                  # 返回结果
+│       ├── client/                           # RPC 客户端
+│       │   ├── ExecutorClient.java           # 客户端主类
+│       │   ├── RpcClientHandler.java         # 消息处理
+│       │   └── NettyClientPool.java          # 连接池
+│       ├── netty/                            # Netty 客户端配置
+│       │   └── ClientChannelInitializer.java
+│       ├── disruptor/
+│       │   ├── TaskDisruptor.java            # Disruptor 队列
+│       │   ├── TaskEvent.java                # 任务事件
+│       │   └── TaskConsumer.java             # 任务消费者
+│       └── spi/
+│           └── JobHandlerRegistry.java       # Handler 注册表
+│
+├── jzero-gateway/                            # API 网关模块
+│   ├── pom.xml
+│   └── src/main/java/com/jzero/gateway/
+│       ├── JZeroGatewayApplication.java
+│       ├── router/
+│       │   ├── RouteDefinition.java          # 路由定义
+│       │   ├── RouteMatcher.java             # 路由匹配
+│       │   └── RouteDefinitionLoader.java    # 路由加载
+│       ├── filter/
+│       │   ├── GatewayFilter.java            # 过滤器接口
+│       │   ├── FilterChain.java              # 过滤器链
+│       │   ├── LoggingFilter.java            # 日志过滤器
+│       │   ├── AuthFilter.java               # 认证过滤器
+│       │   ├── RateLimitFilter.java          # 限流过滤器
+│       │   └── CircuitFilter.java            # 熔断过滤器
+│       └── loadbalancer/
+│           ├── RandomLoadBalancer.java
+│           └── RoundRobinLoadBalancer.java
+│
+├── jzero-registry/                          # 注册中心模块
+│   ├── pom.xml
+│   └── src/main/java/com/jzero/registry/
+│       ├── redis/
+│       │   └── RedisRegistry.java            # Redis 实现
+│       └── nacos/
+│           └── NacosRegistry.java            # Nacos 适配
+│
+├── jzero-admin/                             # 控制台后端
+│   ├── pom.xml
+│   └── src/main/java/com/jzero/admin/
+│       └── controller/
+│           ├── JobController.java            # 任务管理
+│           └── JobLogController.java         # 日志查询
+│
+├── jzero-cli/                               # CLI 代码生成
+│   ├── pom.xml
+│   └── src/main/java/com/jzero/cli/
+│       └── JZeroCli.java                    # 主入口
+│
+├── jzero-spring-boot-starter/               # Spring Boot 自动装配
+│   ├── pom.xml
+│   └── src/main/java/com/jzero/starter/
+│       ├── JZeroAutoConfiguration.java
+│       ├── JZeroProperties.java             # 配置属性
+│       └── JZeroJobScanner.java             # 注解扫描
+│
+└── jzero-test/                            # 测试工具
+    └── src/test/java/com/jzero/
+        └── benchmark/                       # 基准测试
+```
+
+### 3.2 依赖关系
+
+```
+                    ┌─────────────────┐
+                    │   jzero-admin   │
+                    └────────┬────────┘
                              │
-           ┌─────────────────▼───────────────────────────┐
-           │              基础设施层                        │
-           │  MySQL  │  Redis(Sentinel)  │  MQ(Optional)   │
-           └──────────────────────────────────────────────┘
+              ┌──────────────┼──────────────┐
+              │              │              │
+              ▼              ▼              ▼
+    ┌──────────────┐ ┌────────────┐ ┌──────────────┐
+    │jzero-scheduler│ │jzero-gateway│ │jzero-executor│
+    └──────┬───────┘ └──────┬─────┘ └──────┬───────┘
+           │                 │              │
+           └────────────┬────┴──────────────┘
+                        │
+              ┌─────────┴─────────┐
+              │     jzero-core     │
+              └─────────┬─────────┘
+                        │
+              ┌─────────┴──────────┐
+              │    jzero-common    │
+              └────────────────────┘
 ```
-
-### 2.2 节点角色定义
-
-| 角色 | 职责 | 数量建议 |
-|------|------|----------|
-| **Master（Leader）** | 任务调度触发、路由决策、WAL 日志写入 | 1 |
-| **Slave（Follower）** | 实时同步 WAL 状态、热备、故障时自动竞选 | ≥ 2 |
-| **Executor Node** | 执行业务任务，向调度中心注册，与 Master/ Slave 心跳 | 无上限 |
-
-**节点通信协议**
-- Master ↔ Slave：基于 Netty 的 **Raft 简化协议**（心跳 + AppendEntries + Vote）
-- Master → Executor：Netty 长连接 RPC（双向心跳保活）
-- Executor 内：Disruptor 队列接收任务，线程池执行
 
 ---
 
-## 三、主从选举与故障切换
+## 四、核心模块详细设计
 
-### 3.1 选举算法
+### 4.1 主从选举模块
 
-采用类 Raft 的 Leader Election，但使用 Redis 实现简化版，降低运维复杂度：
+#### 4.1.1 模块职责
+
+| 职责 | 说明 |
+|------|------|
+| 选举算法实现 | 基于 Redis CAS 的类 Raft 简化选举 |
+| 故障检测 | 实时检测 Master 心跳，3秒超时判定死亡 |
+| 自动切换 | Master 宕机后自动触发选举，< 3s 完成 |
+| 角色管理 | 管理节点角色状态（Master/Slave/Candidate） |
+| 状态通知 | 选举结果变更时通知所有相关组件 |
+
+#### 4.1.2 核心类设计
 
 ```java
-// 选举核心逻辑
-public class JZeroElection {
+// 节点角色枚举
+public enum NodeRole {
+    MASTER,    // 主节点，负责调度
+    SLAVE,     // 从节点，热备
+    CANDIDATE  // 候选节点，正在竞选
+}
 
-    private static final String LEADER_KEY  = "jzero:cluster:leader";
-    private static final String CANDIDATES   = "jzero:cluster:candidates";
-    private static final long   ELECTION_TIMEOUT_MS = 3000;
-    private static final long   LEADER_TTL_MS       = 5000;
+// 选举管理器接口
+public interface ElectionManager {
+    void start();
+    void stop();
+    NodeRole getCurrentRole();
+    String getMasterNodeId();
+    boolean isMaster();
+    void triggerElection();
+    void addListener(ElectionListener listener);
+}
 
-    // 当前节点发起竞选
-    public boolean campaign(String nodeId) {
-        long now = System.currentTimeMillis();
+// 选举监听器
+public interface ElectionListener {
+    void onBecomeMaster(String nodeId);
+    void onBecomeSlave(String nodeId);
+    void onElectionFailed(String nodeId, String reason);
+}
+```
+
+#### 4.1.3 Redis 选举实现
+
+```java
+@Configuration
+@ConditionalOnProperty(name = "jzero.cluster.election", havingValue = "redis")
+public class RedisElectionManager implements ElectionManager {
+    
+    // Redis Key 定义
+    private static final String LEADER_KEY      = "jzero:cluster:leader";
+    private static final String CANDIDATES_KEY   = "jzero:cluster:candidates";
+    private static final String HEARTBEAT_PREFIX = "jzero:node:heartbeat:";
+    
+    // 时间配置
+    private static final long ELECTION_TIMEOUT_MS = 3000;  // 3秒无心跳认为 leader 死亡
+    private static final long LEADER_TTL_MS = 5000;        // leader 租约 5 秒
+    private static final long HEARTBEAT_INTERVAL_MS = 1000; // 心跳间隔 1 秒
+    
+    private final AtomicReference<NodeRole> currentRole = new AtomicReference<>(NodeRole.SLAVE);
+    private final CopyOnWriteArrayList<ElectionListener> listeners = new CopyOnWriteArrayList<>();
+    private final String currentNodeId;
+    
+    @Override
+    public void start() {
+        // 1. 注册当前节点为候选者
+        registerAsCandidate();
         
-        // 1. 检查当前 leader 是否存活
-        String currentLeader = redis.get(LEADER_KEY);
-        if (currentLeader != null && isLeaderAlive(currentLeader)) {
-            return false;  // 存在活跃 leader，不发起竞选
-        }
+        // 2. 启动心跳发送线程
+        startHeartbeatSender();
         
-        // 2. 所有候选节点随机等待 0-500ms，降低竞争
-        long randomDelay = ThreadLocalRandom.current().nextLong(0, 500);
-        Thread.sleep(randomDelay);
+        // 3. 启动 Master 检测线程
+        startMasterMonitor();
         
-        // 3. CAS 设置 leader（SET NX EX，谁先成功谁赢）
-        Boolean won = redis.setNxEx(
-            LEADER_KEY,
-            nodeId + ":" + now,
-            LEADER_TTL_MS / 1000
-        );
-        
-        if (Boolean.TRUE.equals(won)) {
-            becomeLeader(nodeId);
-            return true;
-        }
-        return false;
+        // 4. 尝试参与选举
+        tryParticipateInElection();
     }
     
-    // Leader 续约（每 2s 执行一次）
-    public void extendLease(String nodeId) {
-        String holder = redis.get(LEADER_KEY);
-        if (nodeId.equals(holder.split(":")[0])) {
-            redis.expire(LEADER_KEY, LEADER_TTL_MS / 1000);
+    @Override
+    public boolean isMaster() {
+        String currentLeader = redisTemplate.opsForValue().get(LEADER_KEY);
+        if (currentLeader == null) return false;
+        return currentLeader.startsWith(currentNodeId + ":");
+    }
+    
+    @Override
+    public void triggerElection() {
+        if (isMaster()) return;
+        
+        currentRole.set(NodeRole.CANDIDATE);
+        
+        try {
+            // 随机等待 0-500ms，降低竞争
+            Thread.sleep(ThreadLocalRandom.current().nextLong(0, 500));
+            
+            // 检查当前 leader 是否存活
+            String currentLeader = redisTemplate.opsForValue().get(LEADER_KEY);
+            if (currentLeader != null && isLeaderAlive(currentLeader)) {
+                currentRole.set(NodeRole.SLAVE);
+                return;
+            }
+            
+            // CAS 设置 leader
+            String newLeaderValue = currentNodeId + ":" + System.currentTimeMillis();
+            Boolean success = redisTemplate.opsForValue().setIfAbsent(
+                LEADER_KEY, newLeaderValue, LEADER_TTL_MS, TimeUnit.MILLISECONDS);
+            
+            if (Boolean.TRUE.equals(success)) {
+                becomeMaster();
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
         }
     }
     
-    // Leader 心跳检测（所有节点每 1s 检测）
-    public boolean isLeaderAlive(String leaderId) {
-        String lastHeartbeat = redis.get("jzero:node:heartbeat:" + leaderId);
-        return lastHeartbeat != null 
-            && (System.currentTimeMillis() - Long.parseLong(lastHeartbeat)) < ELECTION_TIMEOUT_MS;
+    private void becomeMaster() {
+        currentRole.set(NodeRole.MASTER);
+        log.info("节点 {} 当选为 Master", currentNodeId);
+        
+        // 通知所有监听器
+        for (ElectionListener listener : listeners) {
+            listener.onBecomeMaster(currentNodeId);
+        }
+    }
+    
+    private void startMasterMonitor() {
+        scheduler.scheduleAtFixedRate(() -> {
+            if (!isMaster()) {
+                String currentLeader = redisTemplate.opsForValue().get(LEADER_KEY);
+                if (currentLeader != null && !isLeaderAlive(currentLeader)) {
+                    triggerElection();
+                }
+            }
+        }, HEARTBEAT_INTERVAL_MS / 2, HEARTBEAT_INTERVAL_MS, TimeUnit.MILLISECONDS);
     }
 }
 ```
 
-### 3.2 故障检测与切换
+---
+
+### 4.2 WAL 日志模块
+
+#### 4.2.1 模块职责
+
+| 职责 | 说明 |
+|------|------|
+| 状态记录 | 记录所有任务触发和状态变更 |
+| 状态同步 | 异步同步到所有 Slave 节点 |
+| 故障恢复 | 支持故障恢复时的状态重建 |
+| 日志回放 | 提供日志回放能力 |
+
+#### 4.2.2 核心类设计
+
+```java
+// WAL 条目
+@Data
+public class WalEntry implements Serializable {
+    private long   term;           // 当前任期号
+    private long   index;          // 日志序号
+    private String type;           // 条目类型
+    private byte[] data;           // 序列化数据
+    private long   prevLogIndex;  // 前一条日志索引
+    private long   commitIndex;    // 已提交的日志索引
+    
+    public enum Type {
+        TRIGGER,         // 任务触发
+        REGISTRY,        // 注册/下线
+        CONFIG_CHANGE,   // 配置变更
+        LEADERSHIP_CHANGE // 领导权变更
+    }
+}
+
+// WAL 存储接口
+public interface WalStore {
+    long append(WalEntry entry);
+    WalEntry getEntry(long index);
+    List<WalEntry> getEntriesAfter(long startIndex);
+    void commit(long index);
+    long getCommitIndex();
+}
+```
+
+---
+
+## 五、任务调度核心
+
+### 5.1 时间轮调度
+
+```java
+public class JZeroScheduler {
+    
+    // 时间轮配置: tick=100ms, ticks=360 (36秒一圈)
+    private final HashedWheelTimer wheelTimer = new HashedWheelTimer(
+        new NamedThreadFactory("jzero-scheduler"),
+        100, TimeUnit.MILLISECONDS, 360);
+    
+    // 调度触发
+    public void schedule(JobTask task, long triggerAtMs) {
+        long delay = triggerAtMs - System.currentTimeMillis();
+        wheelTimer.newTimeout(timeout -> submitToDisruptor(task), 
+            Math.max(0, delay), TimeUnit.MILLISECONDS);
+    }
+    
+    // CRON 任务注册
+    public void scheduleCron(JobInfo job, String cronExpr) {
+        CronExpression cron = new CronExpression(cronExpr);
+        long next = cron.getNextValidTimeAfter(new Date()).getTime();
+        schedule(new CronJobTask(job, cron), next);
+    }
+}
+```
+
+### 5.2 Disruptor 无锁队列
+
+```java
+public class TaskDisruptor {
+    
+    // Ring Buffer 大小: 2^20 = 1048576
+    private static final int RING_BUFFER_SIZE = 1 << 20;
+    
+    private final Disruptor<TaskEvent> disruptor;
+    
+    public TaskDisruptor(ExecutorService workerPool) {
+        this.disruptor = new Disruptor<>(
+            TaskEvent::new,
+            RING_BUFFER_SIZE,
+            workerPool,
+            ProducerType.MULTI,
+            new BlockingWaitStrategy());
+        
+        this.disruptor.handleEventsWith(this::routeAndDispatch);
+        this.disruptor.start();
+    }
+    
+    // 任务分发
+    private void routeAndDispatch(TaskEvent event, long sequence, boolean endOfBatch) {
+        List<String> executors = registry.getAliveExecutors(event.getJobGroup());
+        ExecutorRouter router = RouterFactory.getRouter(event.getRouteStrategy());
+        String target = router.route(event, executors);
+        rpcClient.sendRunRequest(target, event.toRunRequest());
+    }
+}
+```
+
+### 5.3 路由策略实现
+
+```java
+// 8 种路由策略
+public enum RouteStrategyEnum {
+    ROUND,                    // 轮询
+    RANDOM,                  // 随机
+    CONSISTENT_HASH,         // 一致性哈希
+    LEAST_LFU,              // 最不经常使用
+    FAILOVER,               // 故障转移
+    SHARDING,               // 分片广播
+    BUSY_TRANSFER,          // 忙碌转移
+    WEIGHTED                // 权重轮询
+}
+```
+
+---
+
+## 六、微服务治理模块
+
+### 6.1 API 网关
+
+```java
+// 路由定义
+@Data
+public class RouteDefinition {
+    private String id;
+    private String path;          // /api/**
+    private String serviceId;     // target-service
+    private int weight = 100;
+    private List<String> filters; // ["Auth", "RateLimit"]
+}
+
+// 网关处理器
+@Component
+public class JZeroGatewayHandler {
+    
+    public Mono<Void> handle(ServerWebExchange exchange) {
+        // 1. 路由匹配
+        RouteDefinition route = routeMatcher.match(exchange.getRequest().getPath());
+        
+        // 2. 负载均衡
+        ServiceInstance instance = loadBalancer.select(route.getServiceId());
+        
+        // 3. 过滤器链执行
+        Handler handler = middlewareChain.build(route.getFilters(), 
+            ctx -> proxyToBackend(ctx, instance.getUrl()));
+        
+        return Mono.fromRunnable(() -> handler.handle(exchange));
+    }
+}
+```
+
+### 6.2 熔断器
+
+```java
+public class CircuitBreaker {
+    
+    private final AtomicReference<CircuitState> state = 
+        new AtomicReference<>(CircuitState.CLOSED);
+    private final AtomicLong failureCount = new AtomicLong(0);
+    private final CircuitConfig config;
+    
+    public enum CircuitState { CLOSED, OPEN, HALF_OPEN }
+    
+    public <T> T execute(Supplier<T> action, Supplier<T> fallback) {
+        if (state.get() == CircuitState.OPEN) {
+            if (shouldAttemptReset()) {
+                state.compareAndSet(CircuitState.OPEN, CircuitState.HALF_OPEN);
+            } else {
+                return fallback.get();
+            }
+        }
+        
+        try {
+            T result = action.get();
+            recordSuccess();
+            return result;
+        } catch (Exception e) {
+            recordFailure();
+            return fallback.get();
+        }
+    }
+}
+```
+
+### 6.3 限流器
+
+```java
+// 令牌桶限流（Redis 原子实现）
+public class RedisRateLimiter {
+    
+    private static final String SCRIPT = """
+        local key = KEYS[1]
+        local rate = tonumber(ARGV[1])
+        local capacity = tonumber(ARGV[2])
+        local now = tonumber(ARGV[3])
+        local requested = tonumber(ARGV[4])
+        
+        local data = redis.call('HMGET', key, 'tokens', 'last_time')
+        local tokens = tonumber(data[1]) or capacity
+        local last_time = tonumber(data[2]) or now
+        
+        local elapsed = math.max(0, now - last_time)
+        local new_tokens = math.min(capacity, tokens + elapsed * rate)
+        local allowed = new_tokens >= requested and 1 or 0
+        
+        redis.call('HMSET', key, 'tokens', new_tokens - allowed, 'last_time', now)
+        return {allowed, new_tokens}
+        """;
+    
+    public boolean tryAcquire(int permits) {
+        // Lua 脚本保证原子性
+        return redis.execute(...);
+    }
+}
+```
+
+---
+
+## 七、执行器 SDK
+
+### 7.1 任务注解
+
+```java
+// 任务注解
+@Target(ElementType.METHOD)
+@Retention(RetentionPolicy.RUNTIME)
+public @interface JZeroJob {
+    String value();  // handler 名称
+}
+
+// 使用示例
+@Component
+public class OrderSyncHandler extends JobHandler {
+    
+    @JZeroJob("orderSync")
+    @Override
+    protected ReturnT<String> execute0(JobContext ctx) throws Exception {
+        // 业务逻辑
+        return ReturnT.SUCCESS;
+    }
+}
+```
+
+### 7.2 执行器启动流程
+
+```
+Spring Boot 启动
+    │
+    ▼
+读取 @JZeroJob 注解的方法，注册 handler 映射
+    │
+    ▼
+启动 Netty RPC Client，连接到调度中心
+    │
+    ▼
+注册自身（appName + 地址 + handler 列表）
+    │
+    ▼
+启动心跳线程（每 30s 发送一次 Beat）
+    │
+    ▼
+启动日志上报线程（批量异步上报）
+    │
+    ▼
+等待接收 RunRequest → Disruptor → 线程池执行 → 返回结果
+```
+
+---
+
+## 八、集群高可用设计
+
+### 8.1 故障切换流程
 
 ```
 Master 宕机
     │
     ▼
-所有 Slave 检测到 leader 心跳超时（3s 内）
+所有 Slave 检测到 leader 心跳超时（3s）
     │
     ▼
 触发 electionTimeout，最早醒来的节点发起 campaign
@@ -160,657 +810,18 @@ Redis CAS 竞争获胜 → 成为新 Master
 旧 Master 恢复后降为 Slave
 ```
 
-### 3.3 WAL 状态同步
+### 8.2 数据一致性
 
-Master 每次任务触发写入 WAL，异步同步到所有 Slave：
-
-```java
-// WAL 条目格式
-public class WalEntry {
-    private long   term;           // 当前任期号
-    private long   index;          // 日志序号
-    private String type;           // TRIGGER / REGISTRY / CONFIG_CHANGE
-    private byte[] data;           // 序列化数据
-    private long   prevLogIndex;   // 前一条日志索引
-    private long   prevLogTerm;    // 前一条日志任期
-    private long   commitIndex;    // 已提交的日志索引
-}
-
-// Master 写入 WAL
-public class WalStore {
-    
-    private final RedisTemplate<String, String> redis;
-    private final String walKey = "jzero:wal:entries";
-    
-    public void append(WalEntry entry) {
-        // 写入 Redis List（生产环境建议换成 RocksDB 或 Kafka）
-        redis.opsForList().rightPush(walKey, KryoUtil.serialize(entry));
-        // 异步推送给所有 Slave
-        scheduler.execute(() -> replicateToFollowers(entry));
-    }
-    
-    // 推送 WAL 到指定 Slave
-    private void replicateToFollowers(WalEntry entry) {
-        for (String follower : getActiveFollowers()) {
-            nettyClient.sendAppendEntries(follower, entry);
-        }
-    }
-}
-```
-
-### 3.4 Executor 重连机制
-
-```
-Executor 发现 Master 断开
-    │
-    ▼
-立即尝试连接其他 Slave 节点（获取最新配置）
-    │
-    ▼
-获取 cluster 节点列表，依次尝试连接
-    │
-    ▼
-连接成功后，汇报自身状态（registry + 任务进度）
-    │
-    ▼
-新 Master 下发增量同步（从上次 checkpoint 恢复）
-```
+| 模式 | 说明 | 适用场景 |
+|------|------|----------|
+| 最终一致性 | WAL 异步同步，性能高 | 大多数场景 |
+| 强一致性 | 同步复制 | 金融/支付场景（可选） |
 
 ---
 
-## 四、任务调度核心
+## 九、数据库设计
 
-### 4.1 时间轮调度
-
-使用 HashedWheelTimer 实现高精度、低延迟调度：
-
-```java
-// 调度器核心
-public class JZeroScheduler {
-    
-    // 时间轮： tickDuration=100ms, ticksPerWheel=360 (36秒一圈)
-    private final HashedWheelTimer wheelTimer = new HashedWheelTimer(
-        new NamedThreadFactory("jzero-scheduler-timer"),
-        100, TimeUnit.MILLISECONDS,
-        360
-    );
-    
-    // 调度触发
-    public void schedule(JobTask task, long triggerAtMs) {
-        long delay = triggerAtMs - System.currentTimeMillis();
-        if (delay <= 0) delay = 0;
-        
-        wheelTimer.newTimeout(timeout -> {
-            if (!task.isCancelled()) {
-                submitToDisruptor(task);
-            }
-        }, delay, TimeUnit.MILLISECONDS);
-    }
-    
-    // CRON 任务注册
-    public void scheduleCron(JobInfo job, String cronExpr) {
-        CronExpression cron = new CronExpression(cronExpr);
-        long next = cron.getNextValidTimeAfter(new Date()).getTime();
-        schedule(new CronJobTask(job, cron), next);
-    }
-}
-```
-
-### 4.2 Disruptor 无锁队列
-
-任务触发后进入 Disruptor 队列，后端线程池消费，保证高吞吐：
-
-```java
-public class TaskDisruptor {
-    
-    // Ring Buffer 大小：2^20 = 1048576
-    private static final int RING_BUFFER_SIZE = 1 << 20;
-    
-    private final Disruptor<TaskEvent> disruptor;
-    
-    public TaskDisruptor(ExecutorService workerPool) {
-        this.disruptor = new Disruptor<>(
-            TaskEvent::new,
-            RING_BUFFER_SIZE,
-            workerPool,
-            ProducerType.MULTI,      // 多生产者（多个 TriggerThread）
-            new BlockingWaitStrategy() // 阻塞等待，低延迟场景可用 BusySpin
-        );
-        
-        // 消费者：路由 + RPC 发送
-        this.disruptor.handleEventsWith(this::routeAndDispatch);
-        
-        this.disruptor.start();
-    }
-    
-    // 生产者：TriggerThread 提交任务
-    public void publishTrigger(JobTriggerEvent event) {
-        long sequence = disruptor.publishEvent((e, sequence, evt) -> {
-            e.setJobId(evt.getJobId());
-            e.setHandler(evt.getHandler());
-            e.setParam(evt.getParam());
-            e.setLogId(evt.getLogId());
-        }, event);
-    }
-    
-    // 消费端：路由选择执行器 → Netty RPC 发送
-    private void routeAndDispatch(TaskEvent event, long sequence, boolean endOfBatch) {
-        List<String> executors = registry.getAliveExecutors(event.getJobGroup());
-        if (executors.isEmpty()) {
-            log.warn("No available executor for job: {}", event.getJobId());
-            return;
-        }
-        
-        ExecutorRouter router = RouterFactory.getRouter(event.getRouteStrategy());
-        String target = router.route(event, executors);
-        
-        // 异步 RPC 发送，不阻塞
-        rpcClient.sendRunRequest(target, event.toRunRequest());
-    }
-}
-```
-
-### 4.3 Netty RPC 通信
-
-执行器与调度中心之间采用高性能 Netty RPC：
-
-```java
-// 服务端（调度中心）
-public class RpcServer {
-    
-    private final ServerBootstrap bootstrap = new ServerBootstrap();
-    
-    public void start(int port) {
-        bootstrap.group(bossGroup, workerGroup)
-            .channel(NioServerSocketChannel.class)
-            .option(ChannelOption.SO_BACKLOG, 1024)
-            .option(ChannelOption.TCP_NODELAY, true)        // 禁用 Nagle，低延迟
-            .option(ChannelOption.SO_KEEPALIVE, true)       // TCP 保活
-            .childOption(ChannelOption.ALLOCATOR, PooledByteBufAllocator.DEFAULT)
-            .childHandler(new ChannelInitializer<SocketChannel>() {
-                @Override
-                protected void initChannel(SocketChannel ch) {
-                    ch.pipeline()
-                        .addLast(new KryoEncoder())        // Kryo 高速序列化
-                        .addLast(new KryoDecoder())
-                        .addLast(new IdleStateHandler(30, 0, 0)) // 30s 读空闲检测
-                        .addLast(new RpcServerHandler());  // 业务处理
-                }
-            })
-            .bind(port)
-            .sync();
-    }
-}
-
-// RunRequest 消息体
-public class RunRequest implements Serializable {
-    private long     jobId;
-    private long     logId;
-    private String    handler;
-    private String    param;
-    private int       shardIndex;
-    private int       shardTotal;
-    private String    traceId;     // 链路追踪
-    private String    accessToken; // 执行器认证 token
-}
-
-// RPC Handler
-@ChannelHandler.Sharable
-public class RpcServerHandler extends ChannelInboundHandlerAdapter {
-    
-    @Override
-    public void channelRead(ChannelHandlerContext ctx, Object msg) {
-        if (msg instanceof RunRequest req) {
-            // 提交到执行器内部 Disruptor
-            executor.submit(req);
-        } else if (msg instanceof BeatRequest req) {
-            // 心跳
-            ctx.writeAndFlush(new BeatResponse(System.currentTimeMillis()));
-        } else if (msg instanceof LogReportRequest req) {
-            // 日志上报
-            logService.append(req.getLogId(), req.getLogContent());
-        }
-    }
-}
-```
-
-### 4.4 路由策略实现
-
-```java
-public interface ExecutorRouter {
-    String route(TriggerContext ctx, List<String> aliveExecutors);
-}
-
-// 一致性哈希（保证相同参数的任务落在同一执行器）
-public class ConsistentHashRouter implements ExecutorRouter {
-    
-    private final TreeMap<Long, String> ring = new TreeMap<>();
-    private final int virtualNodes;
-    
-    public ConsistentHashRouter(int virtualNodes) {
-        this.virtualNodes = virtualNodes;
-    }
-    
-    @Override
-    public String route(TriggerContext ctx, List<String> executors) {
-        // 构建哈希环
-        ring.clear();
-        for (String addr : executors) {
-            for (int i = 0; i < virtualNodes; i++) {
-                ring.put(hash("VN-" + addr + "-" + i), addr);
-            }
-        }
-        
-        // 根据任务 ID + 参数哈希选择节点
-        long keyHash = hash(ctx.getJobId() + ":" + ctx.getParam());
-        SortedMap<Long, String> tail = ring.tailMap(keyHash);
-        String node = tail.isEmpty() ? ring.firstEntry().getValue() : tail.get(tail.firstKey());
-        return node;
-    }
-    
-    private long hash(String key) {
-        return MurmurHash.hash64(key);
-    }
-}
-```
-
----
-
-## 五、微服务治理
-
-### 5.1 API 网关
-
-```java
-// 路由定义
-@Data
-public class RouteDefinition {
-    private String id;
-    private String path;          // /api/user/**
-    private String serviceId;     // user-service
-    private int    weight = 100;
-    private List<String> filters; // ["Auth", "RateLimit=2000"]
-    private Map<String, String> metadata;
-}
-
-// 网关处理器
-@Component
-public class JZeroGatewayHandler {
-    
-    private final RouteMatcher     routeMatcher;
-    private final LoadBalancer     loadBalancer;
-    private final MiddlewareChain   middlewareChain;
-    private final ServiceDiscovery  discovery;
-    
-    public Mono<Void> handle(ServerWebExchange exchange) {
-        String path = exchange.getRequest().getPath().value();
-        
-        RouteDefinition route = routeMatcher.match(path);
-        if (route == null) {
-            return notFound(exchange);
-        }
-        
-        ServiceInstance instance = loadBalancer.select(
-            route.getServiceId(),
-            route.getWeight(),
-            LoadBalancerStrategy.WEIGHTED_ROUND_ROBIN
-        );
-        
-        if (instance == null) {
-            return serviceUnavailable(exchange);
-        }
-        
-        // 构建中间件链并执行
-        Handler finalHandler = ctx -> proxyToBackend(ctx, instance);
-        Handler handler = middlewareChain.build(route.getFilters(), finalHandler);
-        
-        return Mono.fromRunnable(() -> {
-            try {
-                handler.handle(new GatewayContext(exchange));
-            } catch (Exception e) {
-                handleError(exchange, e);
-            }
-        });
-    }
-}
-```
-
-### 5.2 服务注册与发现
-
-```java
-// 服务实例
-@Data @AllArgsConstructor
-public class ServiceInstance {
-    private String instanceId;
-    private String serviceId;
-    private String host;
-    private int    port;
-    private String version = "1.0";
-    private String group   = "DEFAULT";
-    private int    weight  = 100;
-    private Map<String, String> metadata;
-    private long   lastHeartbeat;
-    private InstanceStatus status;
-}
-
-// 注册中心抽象
-public interface ServiceRegistry {
-    void register(ServiceInstance instance);
-    void deregister(String serviceId, String instanceId);
-    void heartbeat(String serviceId, String instanceId);
-    List<ServiceInstance> getInstances(String serviceId);
-    List<ServiceInstance> getInstances(String serviceId, String version);
-    void subscribe(String serviceId, Consumer<List<ServiceInstance>> listener);
-}
-
-// 内置注册中心（Redis 实现）
-@Component
-public class RedisServiceRegistry implements ServiceRegistry {
-    
-    private static final String REGISTRY_PREFIX = "jzero:registry:";
-    private static final String INSTANCES_KEY    = "jzero:instances:";
-    
-    @Override
-    public void register(ServiceInstance instance) {
-        String key = INSTANCES_KEY + instance.getServiceId();
-        redisTemplate.opsForHash().put(key, instance.getInstanceId(), toJson(instance));
-        redisTemplate.expire(key, 40, TimeUnit.SECONDS);  // TTL 40s
-    }
-    
-    @Override
-    public void heartbeat(String serviceId, String instanceId) {
-        String key = INSTANCES_KEY + serviceId;
-        String json = (String) redisTemplate.opsForHash().get(key, instanceId);
-        if (json != null) {
-            ServiceInstance inst = fromJson(json);
-            inst.setLastHeartbeat(System.currentTimeMillis());
-            redisTemplate.opsForHash().put(key, instanceId, toJson(inst));
-            redisTemplate.expire(key, 40, TimeUnit.SECONDS);  // 续期
-        }
-    }
-    
-    @Override
-    public List<ServiceInstance> getInstances(String serviceId) {
-        String key = INSTANCES_KEY + serviceId;
-        Map<Object, Object> entries = redisTemplate.opsForHash().entries(key);
-        return entries.values().stream()
-            .map(v -> fromJson((String) v))
-            .filter(i -> System.currentTimeMillis() - i.getLastHeartbeat() < 30_000)
-            .collect(Collectors.toList());
-    }
-}
-```
-
-### 5.3 熔断器
-
-```java
-public class CircuitBreaker {
-    
-    private final AtomicReference<CircuitState> state = 
-        new AtomicReference<>(CircuitState.CLOSED);
-    private final AtomicLong        failureCount = new AtomicLong(0);
-    private final AtomicLong        successCount = new AtomicLong(0);
-    private final CircuitConfig     config;
-    private volatile long            lastFailureTime;
-    
-    public enum CircuitState { CLOSED, OPEN, HALF_OPEN }
-    
-    public <T> T execute(Supplier<T> action, Supplier<T> fallback) {
-        if (state.get() == CircuitState.OPEN) {
-            if (shouldAttemptReset()) {
-                // 尝试半开
-                state.compareAndSet(CircuitState.OPEN, CircuitState.HALF_OPEN);
-            } else {
-                return fallback.get();
-            }
-        }
-        
-        try {
-            T result = action.get();
-            recordSuccess();
-            return result;
-        } catch (Exception e) {
-            recordFailure();
-            return fallback.get();
-        }
-    }
-    
-    private void recordSuccess() {
-        successCount.incrementAndGet();
-        failureCount.set(0);
-        if (state.get() == CircuitState.HALF_OPEN) {
-            // 连续成功则关闭
-            if (successCount.get() >= config.getHalfOpenSuccessThreshold()) {
-                state.set(CircuitState.CLOSED);
-                successCount.set(0);
-            }
-        }
-    }
-    
-    private void recordFailure() {
-        lastFailureTime = System.currentTimeMillis();
-        if (state.get() == CircuitState.HALF_OPEN) {
-            state.set(CircuitState.OPEN);  // 半开下失败立刻打开
-        } else if (failureCount.incrementAndGet() >= config.getFailureThreshold()) {
-            state.set(CircuitState.OPEN);
-        }
-    }
-    
-    private boolean shouldAttemptReset() {
-        return System.currentTimeMillis() - lastFailureTime >= config.getRecoveryTimeoutMs();
-    }
-}
-```
-
-### 5.4 限流
-
-```java
-// 令牌桶限流（Redis 原子实现，支持集群）
-public class RedisRateLimiter {
-    
-    private final RedisTemplate<String, String> redis;
-    private final String                        key;
-    private final long                          permitsPerSecond;
-    private final long                          burstCapacity;
-    
-    public RedisRateLimiter(RedisTemplate<String, String> redis, 
-                           String key, long permitsPerSecond, long burstCapacity) {
-        this.redis = redis;
-        this.key = "jzero:ratelimit:" + key;
-        this.permitsPerSecond = permitsPerSecond;
-        this.burstCapacity = burstCapacity;
-    }
-    
-    // Lua 脚本保证原子性
-    private static final String SCRIPT = """
-        local key = KEYS[1]
-        local rate = tonumber(ARGV[1])
-        local capacity = tonumber(ARGV[2])
-        local now = tonumber(ARGV[3])
-        local requested = tonumber(ARGV[4])
-        
-        local data = redis.call('HMGET', key, 'tokens', 'last_time')
-        local tokens = tonumber(data[1]) or capacity
-        local last_time = tonumber(data[2]) or now
-        
-        local elapsed = math.max(0, now - last_time)
-        local new_tokens = math.min(capacity, tokens + elapsed * rate)
-        local allowed = 0
-        
-        if new_tokens >= requested then
-            new_tokens = new_tokens - requested
-            allowed = 1
-        end
-        
-        redis.call('HMSET', key, 'tokens', new_tokens, 'last_time', now)
-        redis.call('EXPIRE', key, 60)
-        
-        return {allowed, new_tokens}
-        """;
-    
-    public boolean tryAcquire(int permits) {
-        String[] keys = { key };
-        String[] args = {
-            String.valueOf(permitsPerSecond),
-            String.valueOf(burstCapacity),
-            String.valueOf(System.currentTimeMillis() / 1000.0),
-            String.valueOf(permits)
-        };
-        Long[] result = redis.execute(
-            (RedisCallback<Long[]>) conn -> 
-                (Long[]) conn.eval(SCRIPT, ReturnType.MULTI, 1, keys, args)
-        );
-        return result != null && result[0] == 1L;
-    }
-}
-```
-
-### 5.5 中间件链
-
-```java
-// 中间件接口
-@FunctionalInterface
-public interface Middleware {
-    GatewayHandler apply(GatewayHandler next);
-}
-
-// 日志中间件
-public class LoggingMiddleware implements Middleware {
-    @Override
-    public GatewayHandler apply(GatewayHandler next) {
-        return ctx -> {
-            long start = System.nanoTime();
-            ctx.response().addCompleteListener(e -> {
-                long cost = (System.nanoTime() - start) / 1_000_000;
-                log.info("{} {} {}ms {}", 
-                    ctx.request().method(),
-                    ctx.request().path(),
-                    cost,
-                    ctx.response().status()
-                );
-            });
-            next.handle(ctx);
-        };
-    }
-}
-
-// 认证中间件
-public class AuthMiddleware implements Middleware {
-    private final JwtUtil jwtUtil;
-    
-    @Override
-    public GatewayHandler apply(GatewayHandler next) {
-        return ctx -> {
-            String token = ctx.request().header("Authorization");
-            if (token == null || !jwtUtil.verify(token)) {
-                ctx.response().setStatus(401);
-                ctx.response().write("Unauthorized");
-                return;
-            }
-            next.handle(ctx);
-        };
-    }
-}
-
-// 链式组合
-GatewayHandler businessHandler = exchange -> proxyToBackend(exchange);
-GatewayHandler chain = new MiddlewareChain()
-    .use(new TracingMiddleware())
-    .use(new LoggingMiddleware())
-    .use(new AuthMiddleware(jwt))
-    .use(new RateLimitMiddleware(limiter))
-    .build(businessHandler);
-```
-
----
-
-## 六、执行器 SDK
-
-### 6.1 核心注解与处理器
-
-```java
-// 任务注解
-@Target(ElementType.METHOD)
-@Retention(RetentionPolicy.RUNTIME)
-public @interface JZeroJob {
-    String value();                            // handler 名称
-    int    initStrategy() default 0;           // 初始化策略
-    int    destroyStrategy() default 0;       // 销毁策略
-}
-
-// 任务上下文
-@Data
-public class JobContext {
-    private final long   jobId;
-    private final long   logId;
-    private final String param;
-    private final int    shardIndex;
-    private final int    shardTotal;
-    private final String traceId;
-}
-
-// 任务基类
-public abstract class JobHandler {
-    
-    public ReturnT<String> execute(JobContext ctx) throws Exception {
-        return execute0(ctx);
-    }
-    
-    protected abstract ReturnT<String> execute0(JobContext ctx) throws Exception;
-    
-    public void init()  {}
-    public void destroy() {}
-}
-
-// 业务使用
-@Component
-public class OrderSyncHandler extends JobHandler {
-    
-    @JZeroJob("orderSync")
-    @Override
-    protected ReturnT<String> execute0(JobContext ctx) {
-        int shard = ctx.getShardIndex();
-        int total = ctx.getShardTotal();
-        log.info("处理分片 {}/{}", shard, total);
-        
-        List<Order> orders = orderService.fetchPending(shard, total);
-        for (Order o : orders) {
-            syncToEs(o);
-        }
-        return ReturnT.SUCCESS;
-    }
-}
-```
-
-### 6.2 执行器启动流程
-
-```
-Spring Boot 启动
-    │
-    ▼
-读取 @JZeroJob 注解的方法，注册 handler 映射
-    │
-    ▼
-启动 Netty RPC Client，连接到调度中心（Master 或任意 Slave）
-    │
-    ▼
-注册自身（appName + 地址 + handler 列表 + 分片数量）
-    │
-    ▼
-启动心跳线程（每 30s 发送一次 Beat）
-    │
-    ▼
-启动日志上报线程（批量异步上报执行日志）
-    │
-    ▼
-等待接收 RunRequest
-    │
-    ▼
-接收 → Disruptor 队列 → 线程池执行 → 返回结果 → 批量上报日志
-```
-
----
-
-## 七、数据库设计
+### 9.1 核心表结构
 
 ```sql
 -- 执行器组
@@ -835,13 +846,11 @@ CREATE TABLE jz_job_info (
     executor_param      VARCHAR(1024) DEFAULT '',
     executor_timeout    INT DEFAULT 0,
     executor_retry      INT DEFAULT 0,
-    block_strategy      VARCHAR(20) DEFAULT 'SERIAL' COMMENT 'SERIAL|DISCARD|COVER',
+    block_strategy      VARCHAR(20) DEFAULT 'SERIAL',
     trigger_status      TINYINT DEFAULT 0,
-    trigger_last_time   BIGINT DEFAULT 0,
     trigger_next_time   BIGINT DEFAULT 0,
     created_at          DATETIME DEFAULT CURRENT_TIMESTAMP,
-    updated_at          DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    INDEX idx_trigger_next (trigger_next_time, trigger_status)
+    updated_at          DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
 );
 
 -- 执行日志
@@ -851,20 +860,17 @@ CREATE TABLE jz_job_log (
     job_id          INT NOT NULL,
     executor_address VARCHAR(255) DEFAULT '',
     executor_handler VARCHAR(255) NOT NULL,
-    executor_param  VARCHAR(1024) DEFAULT '',
     trigger_time    DATETIME(3),
     trigger_code    INT DEFAULT 0,
-    trigger_msg     TEXT,
     handle_time     DATETIME(3),
     handle_code     INT DEFAULT 0,
     handle_msg      TEXT,
     alarm_status    TINYINT DEFAULT 0,
-    trace_id        VARCHAR(64) DEFAULT '',
     INDEX idx_job_id (job_id),
     INDEX idx_trigger_time (trigger_time)
 );
 
--- 服务注册表（心跳）
+-- 服务注册表
 CREATE TABLE jz_service_registry (
     id           BIGINT PRIMARY KEY AUTO_INCREMENT,
     service_id   VARCHAR(64) NOT NULL,
@@ -872,12 +878,9 @@ CREATE TABLE jz_service_registry (
     host         VARCHAR(64) NOT NULL,
     port         INT NOT NULL,
     version      VARCHAR(32) DEFAULT '1.0',
-    `group`      VARCHAR(32) DEFAULT 'DEFAULT',
     weight       INT DEFAULT 100,
-    metadata     TEXT COMMENT 'JSON 格式标签',
-    status       TINYINT DEFAULT 1 COMMENT '1=UP 0=DOWN',
+    status       TINYINT DEFAULT 1,
     heartbeat_at BIGINT NOT NULL,
-    created_at   DATETIME DEFAULT CURRENT_TIMESTAMP,
     UNIQUE KEY uk_instance (instance_id),
     INDEX idx_service (service_id, status)
 );
@@ -885,153 +888,81 @@ CREATE TABLE jz_service_registry (
 
 ---
 
-## 八、Spring Boot Starter
+## 十、配置与接入
+
+### 10.1 Maven 依赖
+
+```xml
+<dependency>
+    <groupId>com.jzero</groupId>
+    <artifactId>jzero-spring-boot-starter</artifactId>
+    <version>1.0.0</version>
+</dependency>
+```
+
+### 10.2 配置示例
 
 ```yaml
-# application.yml
 jzero:
   enabled: true
   
   # 节点配置
   node:
-    id: ${HOSTNAME:node-1}      # 节点唯一 ID
+    id: ${HOSTNAME:node-1}
     cluster:
-      mode: cluster             # standalone / cluster
-      election: redis           # redis / raft
-      registry:
-        - host: 10.0.0.1:6379
-        - host: 10.0.0.2:6379
-        - host: 10.0.0.3:6379
+      mode: cluster  # standalone / cluster
+      election: redis  # redis / raft
   
-  # 调度中心
-  scheduler:
-    enabled: true
-    port: 7777                  # Netty RPC 端口
-  
-  # 执行器（业务应用）
+  # 执行器配置
   executor:
-    enabled: false
     app-name: ${spring.application.name}
-    admin-addresses: http://10.0.0.1:7777,http://10.0.0.2:7777,http://10.0.0.3:7777
-    port: 0                     # 0=不占用额外端口，使用共享 Netty 连接
-    log-path: /data/logs/jzero
-    token: ${JZERO_TOKEN:}
+    admin-addresses: 
+      - http://localhost:7777
   
-  # 微服务网关
+  # 网关配置
   gateway:
     enabled: false
     port: 8888
-  
-  # 服务注册
-  registry:
-    type: redis                 # redis / nacos / embedded
 ```
 
+### 10.3 快速接入
+
 ```java
-// 自动配置
-@Configuration
-@ConditionalOnProperty(prefix = "jzero", name = "enabled", havingValue = "true", matchIfMissing = true)
-public class JZeroAutoConfiguration {
-    
-    @Bean
-    public JZeroScheduler jZeroScheduler(JZeroProperties p) {
-        return new JZeroScheduler(p.getScheduler());
+@SpringBootApplication
+@EnableJZero
+public class MyApplication {
+    public static void main(String[] args) {
+        SpringApplication.run(MyApplication.class, args);
     }
+}
+
+@Component
+public class MyJobHandler extends JobHandler {
     
-    @Bean
-    public ExecutorClient executorClient(JZeroProperties p) {
-        return new ExecutorClient(p.getExecutor());
-    }
-    
-    @Bean
-    public JZeroGateway jZeroGateway(JZeroProperties p) {
-        return new JZeroGateway(p.getGateway());
-    }
-    
-    @Bean
-    public ServiceRegistry serviceRegistry(JZeroProperties p) {
-        return new RedisServiceRegistry(p.getRegistry());
+    @JZeroJob("myJob")
+    @Override
+    protected ReturnT<String> execute0(JobContext ctx) {
+        // 业务逻辑
+        return ReturnT.SUCCESS;
     }
 }
 ```
 
 ---
 
-## 九、模块工程结构
+## 十一、性能优化策略
 
-```
-jzero/
-├── pom.xml                          # 父 pom
-│
-├── jzero-common/                    # 公共层（所有模块依赖）
-│   ├── annotation/                  # 注解（@JZeroJob 等）
-│   ├── model/                       # DTO / VO / 枚举
-│   ├── rpc/                         # RPC 消息体（RunRequest / BeatRequest）
-│   └── util/                        # 工具类
-│
-├── jzero-core/                      # 核心抽象
-│   ├── scheduler/                   # 调度抽象（TriggerParam / RouteStrategy）
-│   ├── registry/                    # 注册中心抽象（ServiceRegistry SPI）
-│   ├── circuit/                     # 熔断器
-│   └── middleware/                  # 中间件接口
-│
-├── jzero-scheduler/                 # 调度中心模块
-│   ├── trigger/                     # 时间轮调度
-│   ├── election/                    # 主从选举
-│   ├── wal/                         # WAL 日志同步
-│   ├── rpc-server/                  # Netty RPC 服务端
-│   └── log/                         # 执行日志服务
-│
-├── jzero-executor/                  # 执行器 SDK
-│   ├── handler/                     # JobHandler 基类
-│   ├── client/                      # Netty RPC 客户端
-│   ├── netty/                       # Disruptor + 线程池
-│   └── annotation-processor/       # 编译时扫描 @JZeroJob
-│
-├── jzero-gateway/                   # API 网关
-│   ├── router/                      # 动态路由
-│   ├── filter/                      # 网关过滤器
-│   └── loadbalancer/                # 负载均衡策略
-│
-├── jzero-registry/                  # 注册中心
-│   ├── embedded/                    # 内置轻量实现
-│   └── redis/                       # Redis 实现（生产推荐）
-│
-├── jzero-admin/                     # 控制台后端
-│
-├── jzero-cli/                       # CLI 代码生成
-│
-├── jzero-spring-boot-starter/       # Spring Boot 自动装配
-│
-└── jzero-test/                      # 测试工具
-```
+### 11.1 网络优化
 
----
+| 优化点 | 实现方式 |
+|--------|----------|
+| 连接复用 | Netty 长连接池 |
+| 序列化 | Kryo 二进制序列化 |
+| 零拷贝 | Netty FileRegion |
+| TCP 参数 | TCP_NODELAY, SO_KEEPALIVE |
 
-## 十、开发计划
+### 11.2 内存优化
 
-| 阶段 | 时间 | 里程碑 |
-|------|------|--------|
-| **Phase 1** | 第 1-3 月 | 分布式集群核心：Raft 选举 + WAL + 节点通信 |
-| **Phase 2** | 第 2-4 月 | 调度核心：时间轮 + Disruptor + Netty RPC + 8 种路由 |
-| **Phase 3** | 第 3-4 月 | 执行器 SDK + Spring Boot Starter |
-| **Phase 4** | 第 4-5 月 | 微服务治理：网关 + 注册发现 + 熔断 + 限流 + 中间件链 |
-| **Phase 5** | 第 5-6 月 | 控制台 + CLI + 链路追踪 + 告警 |
-| **Phase 6** | 第 6-7 月 | 压测 + 性能优化 + 文档 + Release |
-
----
-
-## 十一、关键技术指标承诺
-
-| 指标 | 目标 | 压测方法 |
-|------|------|----------|
-| 调度延迟 P99 | < 10ms | 1 万并发任务 / 秒 |
-| RPC 延迟 P99 | < 5ms | JMH 微基准测试 |
-| 集群故障切换 | < 3s | 强制 kill Master 进程 |
-| 网关吞吐 | > 50,000 QPS | wrk / hey 压测 |
-| 日志写入吞吐 | > 100,000 条/秒 | 异步批量写入 |
-| 内存占用 | < 512MB（空载） | JMX 监控 |
-
----
-
-*文档维护：研发团队 | 最后更新：2026-03-21*
+| 优化点 | 实现方式 |
+|--------|----------|
+| 对象池 | Disruptor RingBuffer
