@@ -13,5 +13,13 @@ import java.io.Serializable;
 
 @Data
 public class RunRequest implements Serializable {
-
+    /**job的全局ID */
+    private long jobId;
+    private long logId;
+    private String handler;
+    private String param;
+    private int shardIndex;
+    private int shardTotal;
+    private String traceId;
+    private String accessToken;
 }
