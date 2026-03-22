@@ -44,8 +44,16 @@
     <!-- 模块定义 -->
     <modules>
         <module>jzero-common</module>
-<!--        <module>jzero-core</module>-->
-<!--        <module>jzero-scheduler</module>-->
+        <module>jzero-core</module>
+        <module>jzero-scheduler</module>
+        <module>jzero-executor</module>
+        <module>jzero-gateway</module>
+        <module>jzero-registry</module>
+        <module>jzero-admin</module>
+        <module>jzero-cli</module>
+        <module>jzero-spring-boot-starter</module>
+        <module>jzero-test</module>
+        <!--        <module>jzero-scheduler</module>-->
 <!--        <module>jzero-executor</module>-->
 <!--        <module>jzero-gateway</module>-->
 <!--        <module>jzero-registry</module>-->
